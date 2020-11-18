@@ -350,7 +350,10 @@ func (s *Server) dispatch(sessionCtx *sessionContext, streamWriter events.Stream
 			onSessionEnd:   s.emitSessionEndEventFn(streamWriter),
 			onQuery:        s.emitQueryEventFn(streamWriter),
 			clock:          s.Clock,
-			FieldLogger:    s.Entry,
+			FieldLogger: s.Entry.WithFields(logrus.Fields{
+				"id": sessionCtx.id,
+				"db": sessionCtx.db.Name,
+			}),
 		}, nil
 	}
 	return nil, trace.BadParameter("unsupported database procotol %q",
@@ -380,10 +383,6 @@ func (s *Server) authorize(ctx context.Context) (*sessionContext, error) {
 		}
 	}
 	s.Debugf("Will connect to database %q at %v.", db.Name, db.URI)
-	// err = authContext.Checker.CheckAccessToDatabase(defaults.Namespace, "", "", db)
-	// if err != nil {
-	// 	return nil, trace.Wrap(err)
-	// }
 	return &sessionContext{
 		id:       uuid.New(),
 		db:       db,

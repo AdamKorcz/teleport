@@ -51,12 +51,19 @@ func (s *Server) GenerateDatabaseCert(ctx context.Context, req *proto.DatabaseCe
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	cert, err := tlsCA.GenerateCertificate(tlsca.CertificateRequest{
+	certReq := tlsca.CertificateRequest{
 		Clock:     s.clock,
 		PublicKey: csr.PublicKey,
 		Subject:   csr.Subject,
 		NotAfter:  s.clock.Now().UTC().Add(req.TTL.Get()),
-	})
+	}
+	// Include provided server name as a SAN in the certificate, CommonName
+	// has been deprecated since Go 1.15:
+	//   https://golang.org/doc/go1.15#commonname
+	if req.ServerName != "" {
+		certReq.DNSNames = []string{req.ServerName}
+	}
+	cert, err := tlsCA.GenerateCertificate(certReq)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

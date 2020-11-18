@@ -2588,13 +2588,14 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		dbProxyServer, err := db.NewProxyServer(db.ProxyServerConfig{
-			AuthClient:  conn.Client,
-			AccessPoint: accessPoint,
-			Authorizer:  authorizer,
-			Tunnel:      tsrv,
-			TLSConfig:   tlsConfig,
-		})
+		dbProxyServer, err := db.NewProxyServer(process.ExitContext(),
+			db.ProxyServerConfig{
+				AuthClient:  conn.Client,
+				AccessPoint: accessPoint,
+				Authorizer:  authorizer,
+				Tunnel:      tsrv,
+				TLSConfig:   tlsConfig,
+			})
 		if err != nil {
 			return trace.Wrap(err)
 		}

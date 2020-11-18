@@ -66,8 +66,8 @@ type postgresProxy struct {
 	logrus.FieldLogger
 }
 
-func (p *postgresProxy) handleConnection(ctx context.Context, conn net.Conn) (err error) {
-	startupMessage, tlsConn, backend, err := p.handleStartup(ctx, conn)
+func (p *postgresProxy) handleConnection(ctx context.Context, clientConn net.Conn) (err error) {
+	startupMessage, tlsConn, backend, err := p.handleStartup(ctx, clientConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -98,9 +98,9 @@ func (p *postgresProxy) handleConnection(ctx context.Context, conn net.Conn) (er
 //
 // Returns the startup message that contains initial connect parameters and
 // the upgraded TLS connection.
-func (p *postgresProxy) handleStartup(ctx context.Context, conn net.Conn) (*pgproto3.StartupMessage, *tls.Conn, *pgproto3.Backend, error) {
+func (p *postgresProxy) handleStartup(ctx context.Context, clientConn net.Conn) (*pgproto3.StartupMessage, *tls.Conn, *pgproto3.Backend, error) {
 	// Backend acts as a server for the Postgres wire protocol.
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
+	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
 	startupMessage, err := backend.ReceiveStartupMessage()
 	if err != nil {
 		return nil, nil, nil, trace.Wrap(err)
@@ -117,21 +117,21 @@ func (p *postgresProxy) handleStartup(ctx context.Context, conn net.Conn) (*pgpr
 	switch m := startupMessage.(type) {
 	case *pgproto3.SSLRequest:
 		// Send 'S' back to indicate TLS support to the client.
-		_, err := conn.Write([]byte("S"))
+		_, err := clientConn.Write([]byte("S"))
 		if err != nil {
 			return nil, nil, nil, trace.Wrap(err)
 		}
 		// Upgrade the connection to TLS and wait for the next message
 		// which should be of the StartupMessage type.
-		conn = tls.Server(conn, p.tlsConfig)
-		return p.handleStartup(ctx, conn)
+		clientConn = tls.Server(clientConn, p.tlsConfig)
+		return p.handleStartup(ctx, clientConn)
 	case *pgproto3.StartupMessage:
 		// TLS connection between the client and this proxy has been
 		// established, just return the startup message.
-		tlsConn, ok := conn.(*tls.Conn)
+		tlsConn, ok := clientConn.(*tls.Conn)
 		if !ok {
 			return nil, nil, nil, trace.BadParameter(
-				"expected tls connection, got %T", conn)
+				"expected tls connection, got %T", clientConn)
 		}
 		return m, tlsConn, backend, nil
 	}
@@ -140,8 +140,8 @@ func (p *postgresProxy) handleStartup(ctx context.Context, conn net.Conn) (*pgpr
 }
 
 // proxyToSite starts proxying all traffic received from Postgres client
-// between this proxy and Teleport database server over reverse tunnel.
-func (p *postgresProxy) proxyToSite(conn, siteConn net.Conn, startupMessage *pgproto3.StartupMessage) error {
+// between this proxy and Teleport database service over reverse tunnel.
+func (p *postgresProxy) proxyToSite(clientConn, siteConn net.Conn, startupMessage *pgproto3.StartupMessage) error {
 	// Frontend acts as a client for the Posgres wire protocol.
 	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(siteConn), siteConn)
 	// Pass the startup message along to the Teleport database server.
@@ -149,8 +149,8 @@ func (p *postgresProxy) proxyToSite(conn, siteConn net.Conn, startupMessage *pgp
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	go io.Copy(siteConn, conn)
-	_, err = io.Copy(conn, siteConn)
+	go io.Copy(siteConn, clientConn)
+	_, err = io.Copy(clientConn, siteConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -193,20 +193,20 @@ func toErrorResponse(err error) *pgproto3.ErrorResponse {
 	}
 }
 
-func (e *postgresEngine) handleConnection(ctx context.Context, sessionCtx *sessionContext, conn net.Conn) (err error) {
-	// TODO(r0mant): Set deadline on the connection for startup message.
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
+func (e *postgresEngine) handleConnection(ctx context.Context, sessionCtx *sessionContext, clientConn net.Conn) (err error) {
+	// TODO(r0mant): Set deadline on the connection for startup message?
+	client := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
 	defer func() {
 		if err != nil {
-			if err := backend.Send(toErrorResponse(err)); err != nil {
-				e.WithError(err).Error("Failed to send error to backend.")
+			if err := client.Send(toErrorResponse(err)); err != nil {
+				e.WithError(err).Error("Failed to send error to client.")
 			}
 		}
 	}()
 	// The proxy is supposed to pass a startup message it received from
 	// the psql client over to us, so wait for it and extract database
 	// and username from it.
-	err = e.handleStartup(backend, sessionCtx)
+	err = e.handleStartup(client, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -214,11 +214,11 @@ func (e *postgresEngine) handleConnection(ctx context.Context, sessionCtx *sessi
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	frontend, frontendConn, err := e.connect(ctx, sessionCtx)
+	server, hijackedConn, err := e.connect(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	err = e.makeClientReady(backend, frontendConn)
+	err = e.makeClientReady(client, hijackedConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -228,20 +228,43 @@ func (e *postgresEngine) handleConnection(ctx context.Context, sessionCtx *sessi
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	// Now launch the message exchange relaying all intercepted messages
-	// between the backend (psql) and the frontend (database).
-	go e.receiveFromBackend(backend, frontend, sessionCtx)
-	err = e.receiveFromFrontend(frontend, backend, sessionCtx)
+	defer func() {
+		err := e.onSessionEnd(*sessionCtx)
+		if err != nil {
+			e.Error("Failed to emit audit event.")
+		}
+	}()
+	serverConn, err := pgconn.Construct(hijackedConn)
 	if err != nil {
 		return trace.Wrap(err)
+	}
+	defer func() {
+		err = serverConn.Close(ctx)
+		if err != nil {
+			e.Error("Failed to close connection.")
+		}
+	}()
+	// Now launch the message exchange relaying all intercepted messages b/w
+	// the client (psql or other Postgres client) and the server (database).
+	clientErrCh := make(chan error, 1)
+	serverErrCh := make(chan error, 1)
+	go e.receiveFromClient(client, server, clientErrCh, sessionCtx)
+	go e.receiveFromServer(server, client, serverConn, serverErrCh, sessionCtx)
+	select {
+	case err := <-clientErrCh:
+		e.WithError(err).Debug("Client done.")
+	case err := <-serverErrCh:
+		e.WithError(err).Debug("Server done.")
+	case <-ctx.Done():
+		e.Debug("Context canceled.")
 	}
 	return nil
 }
 
 // handleStartup receives a startup message from the proxy and updates
 // the session context with the connection parameters.
-func (e *postgresEngine) handleStartup(backend *pgproto3.Backend, sessionCtx *sessionContext) error {
-	startupMessageI, err := backend.ReceiveStartupMessage()
+func (e *postgresEngine) handleStartup(client *pgproto3.Backend, sessionCtx *sessionContext) error {
+	startupMessageI, err := client.ReceiveStartupMessage()
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -285,85 +308,95 @@ func (e *postgresEngine) connect(ctx context.Context, sessionCtx *sessionContext
 
 // makeClientReady indicates to the Postgres client (such as psql) that the
 // server is ready to accept messages from it.
-func (e *postgresEngine) makeClientReady(backend *pgproto3.Backend, frontendConn *pgconn.HijackedConn) error {
+func (e *postgresEngine) makeClientReady(client *pgproto3.Backend, hijackedConn *pgconn.HijackedConn) error {
 	// AuthenticationOk indicates that the authentication was successful.
 	e.Debug("Sending AuthenticationOk.")
-	if err := backend.Send(&pgproto3.AuthenticationOk{}); err != nil {
+	if err := client.Send(&pgproto3.AuthenticationOk{}); err != nil {
 		return trace.Wrap(err)
 	}
+	// TODO(r0mant): Fix this so CancelRequest works.
 	e.Debug("Sending BackendKeyData.")
-	if err := backend.Send(&pgproto3.BackendKeyData{ProcessID: 123, SecretKey: 456}); err != nil {
+	if err := client.Send(&pgproto3.BackendKeyData{ProcessID: 123, SecretKey: 456}); err != nil {
 		return trace.Wrap(err)
 	}
 	// ParameterStatuses contains parameters reported by the server such as
 	// server version, relay them back to the client.
-	e.Debugf("Sending ParameterStatuses: %v.", frontendConn.ParameterStatuses)
-	for k, v := range frontendConn.ParameterStatuses {
-		if err := backend.Send(&pgproto3.ParameterStatus{Name: k, Value: v}); err != nil {
+	e.Debugf("Sending ParameterStatuses: %v.", hijackedConn.ParameterStatuses)
+	for k, v := range hijackedConn.ParameterStatuses {
+		if err := client.Send(&pgproto3.ParameterStatus{Name: k, Value: v}); err != nil {
 			return trace.Wrap(err)
 		}
 	}
 	// ReadyForQuery indicates that the server is ready to accept messages.
 	e.Debug("Sending ReadyForQuery")
-	if err := backend.Send(&pgproto3.ReadyForQuery{}); err != nil {
+	if err := client.Send(&pgproto3.ReadyForQuery{}); err != nil {
 		return trace.Wrap(err)
 	}
 	return nil
 }
 
-// receiveFromBackend receives messages from the provided backend (which
+// receiveFromClient receives messages from the provided backend (which
 // in turn receives them from psql or other client) and relays them to
 // the frontend connected to the database instance.
-func (e *postgresEngine) receiveFromBackend(backend *pgproto3.Backend, frontend *pgproto3.Frontend, sessionCtx *sessionContext) error {
-	defer e.Debug("Stop receiving from backend.")
+func (e *postgresEngine) receiveFromClient(client *pgproto3.Backend, server *pgproto3.Frontend, clientErrCh chan<- error, sessionCtx *sessionContext) {
+	log := e.WithField("from", "client")
+	defer log.Debug("Stop receiving from client.")
 	for {
-		message, err := backend.Receive()
+		message, err := client.Receive()
 		if err != nil {
-			e.WithError(err).Error("Failed to receive message from backend.")
-			return trace.Wrap(err)
+			log.WithError(err).Errorf("Failed to receive message from client.")
+			clientErrCh <- err
+			return
 		}
-		e.Debugf("Received backend message: %#v.", message)
+		log.Debugf("Received client message: %#v.", message)
 		switch msg := message.(type) {
 		case *pgproto3.Query:
 			err := e.onQuery(*sessionCtx, msg.String)
 			if err != nil {
-				e.WithError(err).Error("Failed to emit audit event.")
+				log.WithError(err).Error("Failed to emit audit event.")
 			}
 		case *pgproto3.Terminate:
-			err := e.onSessionEnd(*sessionCtx)
-			if err != nil {
-				e.WithError(err).Error("Failed to emit audit event.")
-			}
+			clientErrCh <- nil
+			return
 		}
-		err = frontend.Send(message)
+		err = server.Send(message)
 		if err != nil {
-			e.WithError(err).Error("Failed to send message to frontend.")
-			return trace.Wrap(err)
+			log.WithError(err).Error("Failed to send message to server.")
+			clientErrCh <- err
+			return
 		}
 	}
 }
 
-// receiveFromFrontend receives messages from the provided frontend (which
+// receiveFromServer receives messages from the provided frontend (which
 // is connected to the database instance) and relays them back to the psql
 // or other client via the provided backend.
-func (e *postgresEngine) receiveFromFrontend(frontend *pgproto3.Frontend, backend *pgproto3.Backend, sessionCtx *sessionContext) error {
-	defer e.Debug("Stop receiving from frontend.")
+func (e *postgresEngine) receiveFromServer(server *pgproto3.Frontend, client *pgproto3.Backend, serverConn *pgconn.PgConn, serverErrCh chan<- error, sessionCtx *sessionContext) {
+	log := e.WithField("from", "server")
+	defer log.Debug("Stop receiving from server.")
 	for {
-		message, err := frontend.Receive()
+		message, err := server.Receive()
 		if err != nil {
-			e.WithError(err).Error("Failed to receive message from server")
-			return trace.Wrap(err)
+			if serverConn.IsClosed() {
+				log.Debug("Server connection closed.")
+				serverErrCh <- nil
+				return
+			}
+			log.WithError(err).Errorf("Failed to receive message from server.")
+			serverErrCh <- err
+			return
 		}
-		e.Debugf("Received frontend message: %#v.", message)
+		log.Debugf("Received server message: %#v.", message)
 		switch message.(type) {
 		case *pgproto3.ErrorResponse:
 		case *pgproto3.DataRow:
 		case *pgproto3.CommandComplete:
 		}
-		err = backend.Send(message)
+		err = client.Send(message)
 		if err != nil {
-			e.WithError(err).Error("Failed to send message to backend.")
-			return trace.Wrap(err)
+			log.WithError(err).Error("Failed to send message to client.")
+			serverErrCh <- err
+			return
 		}
 	}
 }

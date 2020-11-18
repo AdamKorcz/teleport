@@ -123,7 +123,7 @@ func (process *TeleportProcess) initDatabaseService() error {
 		return trace.Wrap(err)
 	}
 
-	// Create and start the database server which will alos start dynamic labels.
+	// Create and start the database server which will also start dynamic labels.
 	dbServer, err := db.New(process.ExitContext(), db.Config{
 		DataDir:      process.Config.DataDir,
 		AuthClient:   conn.Client,

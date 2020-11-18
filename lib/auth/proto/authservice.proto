@@ -426,8 +426,10 @@ message DatabaseCSRResponse {
 message DatabaseCertRequest {
     // CSR is the request to sign.
     bytes CSR = 1 [ (gogoproto.jsontag) = "csr" ];
+    // ServerName is the SAN to include in the certificate.
+    string ServerName = 2 [ (gogoproto.jsontag) = "server_name" ];
     // TTL is the certificate validity period.
-    int64 TTL = 2 [ (gogoproto.jsontag) = "ttl", (gogoproto.casttype) = "Duration" ];
+    int64 TTL = 3 [ (gogoproto.jsontag) = "ttl", (gogoproto.casttype) = "Duration" ];
 }
 
 // DatabaseCertResponse contains the signed certificate.

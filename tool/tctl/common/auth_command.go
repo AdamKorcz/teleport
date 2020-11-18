@@ -362,10 +362,15 @@ func (a *AuthCommand) generateDatabaseKeys(clusterAPI auth.ClientI) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	resp, err := clusterAPI.GenerateDatabaseCert(context.TODO(), &proto.DatabaseCertRequest{
-		CSR: csr,
-		TTL: proto.Duration(a.genTTL),
-	})
+	resp, err := clusterAPI.GenerateDatabaseCert(context.TODO(),
+		&proto.DatabaseCertRequest{
+			CSR: csr,
+			// Important to include server name as SAN since CommonName has
+			// been deprecated since Go 1.15:
+			//   https://golang.org/doc/go1.15#commonname
+			ServerName: a.genHost,
+			TTL:        proto.Duration(a.genTTL),
+		})
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -375,7 +380,8 @@ func (a *AuthCommand) generateDatabaseKeys(clusterAPI auth.ClientI) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	fmt.Printf("\nThe credentials have been written to %s\n", strings.Join(filesWritten, ", "))
+	fmt.Printf("\nThe credentials have been written to %s\n",
+		strings.Join(filesWritten, ", "))
 	return nil
 }
 
